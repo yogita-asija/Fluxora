@@ -11,9 +11,15 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     full_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # argon2id hash. Never returned by the API (see schemas/auth.py).
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
     role: Mapped[str] = mapped_column(
         String(32), default=UserRole.CUSTOMER.value, server_default=UserRole.CUSTOMER.value
     )
     is_active: Mapped[bool] = mapped_column(default=True, server_default=true())
 
     orders: Mapped[list["Order"]] = relationship(back_populates="user")  # noqa: F821
+
+    @property
+    def is_admin(self) -> bool:
+        return self.role == UserRole.ADMIN.value

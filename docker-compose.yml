@@ -8,6 +8,10 @@ x-backend-environment: &backend-environment
   REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}@redis:6379/0
   RABBITMQ_URL: amqp://${RABBITMQ_USER:?set RABBITMQ_USER in .env}:${RABBITMQ_PASSWORD:?set RABBITMQ_PASSWORD in .env}@rabbitmq:5672/
   KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  JWT_SECRET_KEY: ${JWT_SECRET_KEY:?set JWT_SECRET_KEY in .env (run python scripts/init_env.py)}
+  ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
+  SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD:-}
+  SEED_CUSTOMER_PASSWORD: ${SEED_CUSTOMER_PASSWORD:-}
   CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:8080,http://localhost:5173}
 
 services:

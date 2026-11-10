@@ -13,6 +13,8 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (
         CheckConstraint(in_values("status", OrderStatus), name="status_valid"),
         CheckConstraint("total_amount >= 0", name="total_non_negative"),
+        # Scoped per user: one customer's key can never collide with, or reveal, another's.
+        UniqueConstraint("user_id", "idempotency_key", name="uq_orders_user_id_idempotency_key"),
     )
 
     user_id: Mapped[uuid.UUID] = mapped_column(
@@ -26,12 +28,14 @@ class Order(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     total_amount: Mapped[Decimal] = mapped_column(Numeric(12, 2), nullable=False)
     currency: Mapped[str] = mapped_column(String(3), default="USD", server_default="USD")
-    # Lets clients retry order creation safely: same key -> same order.
-    idempotency_key: Mapped[str | None] = mapped_column(String(128), unique=True)
+    # Lets clients retry order creation safely: same key (and same request) -> same order.
+    idempotency_key: Mapped[str | None] = mapped_column(String(128))
+    # SHA-256 of the canonical request, to detect a key being reused with a different request.
+    request_hash: Mapped[str | None] = mapped_column(String(64))
 
     user: Mapped["User"] = relationship(back_populates="orders")  # noqa: F821
     items: Mapped[list["OrderItem"]] = relationship(
-        back_populates="order", cascade="all, delete-orphan"
+        back_populates="order", cascade="all, delete-orphan", order_by="OrderItem.id"
     )
     payments: Mapped[list["Payment"]] = relationship(back_populates="order")  # noqa: F821
     reservations: Mapped[list["InventoryReservation"]] = relationship(  # noqa: F821
@@ -59,3 +63,15 @@ class OrderItem(UUIDPrimaryKeyMixin, Base):
 
     order: Mapped["Order"] = relationship(back_populates="items")
     product: Mapped["Product"] = relationship()  # noqa: F821
+
+    @property
+    def product_sku(self) -> str:
+        return self.product.sku
+
+    @property
+    def product_name(self) -> str:
+        return self.product.name
+
+    @property
+    def line_total(self) -> Decimal:
+        return self.unit_price * self.quantity

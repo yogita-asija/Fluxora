@@ -1,17 +1,30 @@
-"""Idempotent demo data. Run with: python -m app.seed"""
+"""Idempotent demo data. Run with: python -m app.seed
 
+Demo accounts get their passwords from SEED_ADMIN_PASSWORD / SEED_CUSTOMER_PASSWORD
+(set in .env). If a variable is empty, a random password is generated and printed once.
+Passwords are only set for accounts that don't have one yet; existing ones are never reset.
+"""
+
+import os
+import secrets
 from decimal import Decimal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.database import SessionLocal
+from app.core.security import UNUSABLE_PASSWORD, hash_password
 from app.models import Inventory, Order, OrderItem, Payment, Product, User
 from app.models.enums import OrderStatus, PaymentStatus, UserRole
+from app.schemas.auth import MIN_PASSWORD_LENGTH
 
+ADMIN_EMAIL = "admin@orderflow.local"
+CUSTOMER_EMAIL = "customer@orderflow.local"
+
+# (email, full name, role)
 USERS = [
-    ("admin@orderflow.local", "Demo Admin", UserRole.ADMIN),
-    ("customer@orderflow.local", "Demo Customer", UserRole.CUSTOMER),
+    (ADMIN_EMAIL, "Demo Admin", UserRole.ADMIN),
+    (CUSTOMER_EMAIL, "Demo Customer", UserRole.CUSTOMER),
 ]
 
 # (sku, name, description, price, on_hand, reorder_level)
@@ -28,23 +41,43 @@ PRODUCTS = [
 
 # (idempotency_key, user email, status, payment status, [(sku, quantity), ...])
 ORDERS = [
-    ("seed-order-1", "customer@orderflow.local", OrderStatus.PAID, PaymentStatus.CAPTURED,
+    ("seed-order-1", CUSTOMER_EMAIL, OrderStatus.PAID, PaymentStatus.CAPTURED,
      [("KB-MECH-01", 1), ("MS-WRL-02", 2)]),
-    ("seed-order-2", "customer@orderflow.local", OrderStatus.PENDING, PaymentStatus.PENDING,
+    ("seed-order-2", CUSTOMER_EMAIL, OrderStatus.PENDING, PaymentStatus.PENDING,
      [("MN-27-4K", 1)]),
-    ("seed-order-3", "customer@orderflow.local", OrderStatus.FULFILLED, PaymentStatus.CAPTURED,
+    ("seed-order-3", CUSTOMER_EMAIL, OrderStatus.FULFILLED, PaymentStatus.CAPTURED,
      [("HS-ANC-03", 1), ("DK-USB-C", 1)]),
 ]
 
 
-def seed(db: Session) -> dict[str, int]:
-    """Insert demo rows that don't exist yet. Safe to run repeatedly."""
+def seed(
+    db: Session,
+    passwords: dict[str, str] | None = None,
+    generated: dict[str, str] | None = None,
+) -> dict[str, int]:
+    """Insert demo rows that don't exist yet. Safe to run repeatedly.
+
+    `passwords` maps email -> password. Missing entries get a random password, which is
+    recorded in `generated` (if provided) so the caller can show it once.
+    """
+    passwords = passwords or {}
     users = {}
     for email, full_name, role in USERS:
         user = db.scalar(select(User).where(User.email == email))
         if user is None:
-            user = User(email=email, full_name=full_name, role=role.value)
+            user = User(
+                email=email, full_name=full_name, role=role.value, password_hash=UNUSABLE_PASSWORD
+            )
             db.add(user)
+        if user.password_hash == UNUSABLE_PASSWORD:  # new account, or one from before auth existed
+            password = passwords.get(email)
+            if not password:
+                password = secrets.token_urlsafe(16)
+                if generated is not None:
+                    generated[email] = password
+            if len(password) < MIN_PASSWORD_LENGTH:
+                raise ValueError(f"Seed password for {email} must be at least {MIN_PASSWORD_LENGTH} characters")
+            user.password_hash = hash_password(password)
         users[email] = user
 
     products = {}
@@ -84,9 +117,16 @@ def seed(db: Session) -> dict[str, int]:
 
 
 def main() -> None:
+    passwords = {
+        ADMIN_EMAIL: os.environ.get("SEED_ADMIN_PASSWORD", ""),
+        CUSTOMER_EMAIL: os.environ.get("SEED_CUSTOMER_PASSWORD", ""),
+    }
+    generated: dict[str, str] = {}
     with SessionLocal() as db:
-        counts = seed(db)
+        counts = seed(db, passwords, generated)
     print("Seed complete:", ", ".join(f"{k}={v}" for k, v in counts.items()))
+    for email, password in generated.items():
+        print(f"Generated password for {email}: {password}  (shown once; set SEED_*_PASSWORD in .env to choose your own)")
 
 
 if __name__ == "__main__":

@@ -1,14 +1,22 @@
 # OrderFlow
 
-A distributed order-processing platform. This repository is the **foundation**: a runnable skeleton with clean layering, a complete database schema, and the full local infrastructure. Business logic, authentication, and the event-driven workflows come next.
+A distributed order-processing platform. Current state: **Phase 2** — authentication, idempotent order creation with a transactional outbox, and the full local infrastructure. Stock reservation, payments, and the Kafka/RabbitMQ workflows come next.
 
 | Layer | Technology |
 | --- | --- |
 | Frontend | React, Vite, JavaScript, React Router, Tailwind CSS v4, Axios, Recharts |
 | Backend | Python 3.13, FastAPI, Pydantic v2, SQLAlchemy 2.0, Alembic |
 | Data & messaging | PostgreSQL 17, Redis, RabbitMQ, Kafka (KRaft) |
-| Edge & observability | Nginx (load balancing), Prometheus, Grafana |
+| Edge & observability | Nginx (load balancing, rate limiting, security headers), Prometheus, Grafana |
 | Testing | pytest, HTTPX |
+
+## What works today
+
+- **Accounts:** register, sign in, sign out. Argon2id password hashing, short-lived JWT access tokens, roles (`customer`, `admin`).
+- **Orders:** create (prices and totals computed on the server), list (paginated, filter by status), view, cancel. Customers see only their own orders; admins see all.
+- **Idempotent order creation:** every `POST /orders` carries an `Idempotency-Key`. Retrying the same request returns the original order instead of a duplicate; reusing a key with a different request is rejected with 409. Keys are scoped per user.
+- **Transactional outbox:** creating or cancelling an order writes an `outbox_events` row in the **same database transaction**, so an event exists if and only if the change happened. (Publishing those events to Kafka is Phase 3.)
+- **Dashboard:** login/register, orders list, new-order form, order detail with cancel. Products, Inventory, Analytics, and System Health pages from Phase 1.
 
 ## Project structure
 
@@ -18,59 +26,113 @@ orderflow/
 │   ├── app/
 │   │   ├── api/            # HTTP layer: routers and dependencies
 │   │   │   ├── health.py   #   /health/live, /health/ready
-│   │   │   └── v1/         #   versioned routes mounted at /api/v1
-│   │   ├── core/           # config, database, errors, logging, metrics
+│   │   │   └── v1/         #   /api/v1: auth, orders, products
+│   │   ├── core/           # config, database, errors, security (hashing, JWT), rate limit, metrics
 │   │   ├── models/         # SQLAlchemy models (9 tables)
 │   │   ├── schemas/        # Pydantic request/response models
-│   │   ├── services/       # business rules
+│   │   ├── services/       # business rules (auth, orders, products)
 │   │   ├── repositories/   # data access
 │   │   ├── main.py         # app factory
 │   │   └── seed.py         # idempotent demo data
-│   ├── alembic/            # migrations (0001 = initial schema)
+│   ├── alembic/            # migrations: 0001 initial schema, 0002 auth + per-user idempotency
 │   ├── tests/
 │   ├── Dockerfile, requirements.txt, requirements-dev.txt
 ├── frontend/               # React app (Vite)
 ├── infra/
-│   ├── nginx/              # reverse proxy + API load balancing
+│   ├── nginx/              # reverse proxy, load balancing, rate limit, security headers
 │   ├── prometheus/
 │   └── grafana/            # provisioned datasource + dashboard
-├── scripts/init_env.py     # generates .env with random secrets
+├── scripts/init_env.py     # creates/updates .env with random secrets
 ├── docker-compose.yml
 ├── .env.example
 ├── Makefile                # shortcuts (optional)
 └── README.md
 ```
 
-Request flow: `route (api/) → service (services/) → repository (repositories/) → model (models/)`. Routes know HTTP, services know business rules, repositories know SQL. `products` is implemented end to end as the reference pattern; orders, inventory, and payments follow it.
+Request flow: `route (api/) → service (services/) → repository (repositories/) → model (models/)`. Routes know HTTP, services know business rules, repositories know SQL.
 
 ## Quick start (Docker)
 
 Requires Docker with Compose v2.
 
 ```bash
-python3 scripts/init_env.py            # creates .env with generated secrets
-docker compose up -d --build           # builds and starts everything
-docker compose run --rm migrate python -m app.seed   # load demo data
+python3 scripts/init_env.py            # creates .env with generated secrets (or adds missing ones)
+docker compose up -d --build           # builds, migrates, and starts everything
+docker compose run --rm migrate python -m app.seed   # demo data + demo accounts
 ```
+
+Open http://localhost:8080 and sign in with a demo account:
+
+| Account | Email | Password |
+| --- | --- | --- |
+| Customer | `customer@orderflow.local` | `SEED_CUSTOMER_PASSWORD` from your `.env` |
+| Admin | `admin@orderflow.local` | `SEED_ADMIN_PASSWORD` from your `.env` |
+
+Or click **Create one** to register your own account (always a customer).
+
+**Upgrading from Phase 1:** run `python3 scripts/init_env.py` once (it adds the new variables to your existing `.env` without touching the others), then `docker compose up -d --build` and the seed command above. Migration `0002` runs automatically; the seed command gives the existing demo accounts their passwords.
 
 The first start downloads images and takes a few minutes; Kafka and RabbitMQ are the slowest to become healthy. Check progress with `docker compose ps`.
 
 | URL | What |
 | --- | --- |
 | http://localhost:8080 | App (React dashboard) |
-| http://localhost:8080/api/docs | Interactive API docs |
+| http://localhost:8080/api/docs | Interactive API docs (disabled when `ENVIRONMENT=production`) |
 | http://localhost:8080/health/ready | Readiness check |
 | http://localhost:3000 | Grafana (login from `.env`: `GRAFANA_ADMIN_*`) |
 | http://localhost:9090 | Prometheus |
 | http://localhost:15672 | RabbitMQ management (login: `RABBITMQ_*`) |
 
-Migrations run automatically on every `up` through the one-shot `migrate` service; the API replicas wait for it to finish.
+**Load balancing:** `API_REPLICAS` (default 2) sets the number of API containers. Scale live with `docker compose up -d --scale api=4`. Every response through Nginx carries an `X-Upstream` header showing which replica served it.
 
-**Load balancing:** `API_REPLICAS` (default 2) sets the number of API containers. Scale live with `docker compose up -d --scale api=4`. Every response through Nginx carries an `X-Upstream` header showing which replica served it:
+## API overview
+
+All routes are under `/api/v1`. Errors always look like `{"error": {"code", "message", "details"}}`.
+
+| Method & path | Auth | Description |
+| --- | --- | --- |
+| `POST /auth/register` | – | Create a customer account → `201` |
+| `POST /auth/login` | – | `{email, password}` → `{access_token, token_type, expires_in}` |
+| `GET /auth/me` | Bearer | Current user |
+| `GET /products`, `GET /products/{id}` | – | Catalogue |
+| `POST /orders` | Bearer + `Idempotency-Key` header | `{"items": [{"product_id", "quantity"}]}` → `201` new order, `200` replay of an earlier identical request |
+| `GET /orders?status=&limit=&offset=` | Bearer | Own orders (admin: all), newest first |
+| `GET /orders/{id}` | Bearer | One order (someone else's is `404`) |
+| `POST /orders/{id}/cancel` | Bearer | Cancel a `pending` order; otherwise `409` |
+
+Try it from the command line:
 
 ```bash
-for i in 1 2 3 4; do curl -sI localhost:8080/health/live | grep X-Upstream; done
+TOKEN=$(curl -s localhost:8080/api/v1/auth/login -H 'content-type: application/json' \
+  -d '{"email":"customer@orderflow.local","password":"<SEED_CUSTOMER_PASSWORD>"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["access_token"])')
+
+curl -s localhost:8080/api/v1/orders -H "Authorization: Bearer $TOKEN" -H 'Idempotency-Key: demo-key-0001' \
+  -H 'content-type: application/json' -d '{"items":[{"product_id":"<id from /products>","quantity":2}]}'
 ```
+
+Run the same order command twice: the second call returns `200` with the same order and writes no second outbox event.
+
+## Security
+
+| Area | What is done |
+| --- | --- |
+| Passwords | Argon2id (library defaults, RFC 9106). Length 10–128 (the cap prevents hashing-cost DoS). Hashes upgrade transparently if parameters change. Never returned by the API or logged. |
+| Login | One generic error for unknown email, wrong password, and disabled account. A dummy hash is verified for unknown emails so response time doesn't reveal which accounts exist. |
+| Brute force | After 5 failed logins an account is locked for 15 minutes (`429` + `Retry-After`), counted in Redis so all API replicas share it. Nginx additionally limits `/api/v1/auth/` to 20 requests/minute per IP. If Redis is down the lockout fails open (logged) rather than blocking everyone. |
+| Tokens | HS256 JWT, 30 min lifetime, fixed algorithm (no `alg: none` / algorithm confusion), `exp`/`iat`/`sub`/`iss` required. Role and active status are read from the database on every request, so a token can't carry privileges and disabling an account takes effect immediately. The app refuses to start with a missing, short (<32 chars), or placeholder `JWT_SECRET_KEY`. |
+| Authorization | Orders are checked per user in the service layer. Someone else's order returns `404`, not `403`, so ids can't be probed. Admins are only created by the seed script, never through the API. |
+| Input validation | Strict schemas: unknown fields are rejected (no mass assignment of `role`, `price`, `status`, `user_id`). Quantities, item counts, and header formats are bounded. Prices and totals always come from the database. Validation errors never echo submitted values (passwords). |
+| Data integrity | Per-user unique idempotency keys enforced by the database; request fingerprint detects key reuse with a different body; row locks serialise concurrent cancels; money uses `Decimal`/`Numeric`. |
+| HTTP | CORS allow-lists (origins, methods, headers; no credentials). `nosniff` and `Cache-Control: no-store` on API responses. Nginx adds `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`, and a strict Content-Security-Policy on the app. 1 MB request body limit. |
+| Secrets | Nothing is hardcoded. `.env` is generated with random values and git-ignored; Compose fails with a clear message if a secret is missing. |
+
+**Known limitations** (deliberate, listed so they are not mistaken for oversights):
+
+- **No token revocation / refresh tokens.** "Sign out" discards the token in the browser; the token stays valid until it expires (30 min). The standard next step is short access tokens plus a rotating refresh token in an `httpOnly` cookie.
+- **The token is stored in `sessionStorage`**, readable by script. A strict CSP reduces XSS risk; the `httpOnly` cookie approach above would remove it.
+- **No TLS.** Run behind HTTPS (and add `Strict-Transport-Security`) before exposing publicly. Services bind to `127.0.0.1`.
+- **Registration reveals whether an email exists** (`409`). Mitigated by the per-IP rate limit; avoiding it entirely needs email verification.
+- **Account lockout can be triggered by someone else** for a known email (15 minutes). The usual trade-off for brute-force protection.
 
 ## Local development (backend and frontend on the host)
 
@@ -100,7 +162,7 @@ uvicorn app.main:app --reload --port 8000    # in backend/
 npm run dev                                  # in frontend/  -> http://localhost:5173
 ```
 
-Vite proxies `/api` and `/health` to `http://localhost:8000` (override with `VITE_DEV_API_TARGET`).
+Vite proxies `/api` and `/health` to `http://localhost:8000` (override with `VITE_DEV_API_TARGET`). The host-run backend reads `JWT_SECRET_KEY` and `DATABASE_URL` from `.env`.
 
 ## Command reference
 
@@ -116,10 +178,21 @@ Vite proxies `/api` and `/health` to `http://localhost:8000` (override with `VIT
 | Seed (Docker) | `docker compose run --rm migrate python -m app.seed` (`make seed`) |
 | Seed (host) | `cd backend && python -m app.seed` |
 | Backend tests | `cd backend && python -m pytest` (`make test`) |
+| Backend tests on PostgreSQL + Redis | see below |
 | Frontend build | `cd frontend && npm run build` |
 | Logs | `docker compose logs -f api` (`make logs`) |
 
-Backend tests run on in-memory SQLite, so they need no running services. The schema itself (PostgreSQL types, partial index, JSONB) is exercised by `alembic upgrade head` and `alembic check` against a real PostgreSQL.
+**Tests.** By default tests run on in-memory SQLite and need no services. Two tests (concurrent duplicate requests and concurrent cancels) need real row locks and are skipped unless a PostgreSQL URL is provided. Use a throwaway database: the suite drops and recreates its tables.
+
+```bash
+docker compose exec postgres createdb -U orderflow orderflow_test
+cd backend
+TEST_DATABASE_URL=postgresql+psycopg://orderflow:<POSTGRES_PASSWORD>@localhost:15432/orderflow_test \
+TEST_REDIS_URL=redis://:<REDIS_PASSWORD>@localhost:6379/0 \
+python -m pytest
+```
+
+`TEST_REDIS_URL` additionally runs the login-throttle tests against real Redis. (`TEST_REDIS_URL` flushes that Redis database: don't point it at data you care about.) The schema itself (PostgreSQL types, partial index, JSONB) is also exercised by `alembic upgrade head` and `alembic check`.
 
 ## Environment variables
 
@@ -128,16 +201,19 @@ All set in `.env` (see `.env.example`). `.env` is git-ignored.
 | Variable | Purpose |
 | --- | --- |
 | `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` | PostgreSQL credentials (required) |
+| `JWT_SECRET_KEY` | Signs access tokens; 32+ characters (required). `init_env.py` generates 64 hex characters. |
+| `ACCESS_TOKEN_EXPIRE_MINUTES` | Token lifetime (default 30) |
+| `SEED_ADMIN_PASSWORD`, `SEED_CUSTOMER_PASSWORD` | Passwords for the demo accounts, 10+ characters. If empty, the seed command generates and prints random ones once. |
 | `REDIS_PASSWORD` | Redis password (required) |
 | `RABBITMQ_USER`, `RABBITMQ_PASSWORD` | RabbitMQ credentials (required) |
 | `GRAFANA_ADMIN_USER`, `GRAFANA_ADMIN_PASSWORD` | Grafana login (required) |
 | `DATABASE_URL` | Used by the backend **on the host** only; must use the same password as `POSTGRES_PASSWORD`. Containers get theirs from Compose. |
 | `API_REPLICAS` | Number of API containers (default 2) |
 | `CORS_ORIGINS` | Comma-separated allowed browser origins |
-| `ENVIRONMENT`, `LOG_LEVEL` | Runtime mode and log verbosity |
-| `HTTP_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT`, `PROMETHEUS_PORT`, `GRAFANA_PORT` | Host ports (all bound to 127.0.0.1) |
+| `ENVIRONMENT`, `LOG_LEVEL` | Runtime mode (`production` disables API docs) and log verbosity |
+| `HTTP_PORT`, `POSTGRES_PORT`, `REDIS_PORT`, `RABBITMQ_PORT`, `RABBITMQ_MANAGEMENT_PORT`, `PROMETHEUS_PORT`, `GRAFANA_PORT` | Host ports (all bound to 127.0.0.1). PostgreSQL defaults to 15432 to avoid clashes with a local install. |
 
-The backend also accepts `REDIS_URL`, `RABBITMQ_URL`, and `KAFKA_BOOTSTRAP_SERVERS` (injected by Compose) for later phases. Passwords are embedded in connection URLs, so keep them URL-safe; `init_env.py` generates hex strings.
+The backend also accepts `REDIS_URL`, `RABBITMQ_URL`, and `KAFKA_BOOTSTRAP_SERVERS` (injected by Compose). `REDIS_URL` backs the login throttle; without it an in-process store is used (fine for a single process). Passwords are embedded in connection URLs, so keep them URL-safe; `init_env.py` generates hex strings.
 
 ## Database
 
@@ -145,18 +221,19 @@ Nine tables: `users`, `products`, `inventory`, `orders`, `order_items`, `payment
 
 - UUID primary keys, timestamptz timestamps, `Numeric(12,2)` money.
 - CHECK constraints for statuses, non-negative amounts, positive quantities, and `quantity_reserved <= quantity_on_hand`.
-- Unique constraints include `orders.idempotency_key`, `(order_id, product_id)` on items and reservations, and `(event_id, consumer)` on `processed_events` (idempotent consumers).
+- Unique constraints include `(user_id, idempotency_key)` on orders, `(order_id, product_id)` on items and reservations, and `(event_id, consumer)` on `processed_events` (idempotent consumers).
 - `inventory.version` provides optimistic locking.
-- `outbox_events` has a partial index on pending rows for the future outbox relay.
+- `outbox_events` has a partial index on pending rows for the future outbox relay. Order creation writes `order.created` and cancellation writes `order.cancelled`, in the same transaction as the order change.
 - Constraint and index names follow a naming convention so migrations are deterministic.
 
 ## What is intentionally not built yet
 
-Authentication, order placement and its workflow, Kafka producers, RabbitMQ consumers, the outbox relay, and real payment handling. `/health/ready` currently checks PostgreSQL only; Redis, RabbitMQ, and Kafka checks should be added when code starts using them. Orders, Inventory, and Analytics pages are placeholders (Analytics charts use sample data).
+Stock reservation (creating an order does **not** change inventory yet), payments, the outbox relay, Kafka producers, RabbitMQ consumers, and the saga/compensation logic: these are Phase 3 and 4. `/health/ready` checks PostgreSQL only; Redis, RabbitMQ, and Kafka checks should be added when the code depends on them. Inventory and Analytics pages are placeholders (Analytics charts use sample data).
 
 ## Notes and manual steps
 
 - **Run `init_env.py` (or edit `.env`) before `docker compose up`.** Compose refuses to start with a clear message if a required secret is missing.
+- **"ports are not available ... forbidden by its access permissions" (Windows):** a host port is reserved by Windows or used by another program. Find reserved ranges with `netsh interface ipv4 show excludedportrange protocol=tcp`, pick a port outside them, set it in `.env` (e.g. `POSTGRES_PORT=15432`, and the same port in `DATABASE_URL`), then run `docker compose up -d` again. Every host port is configurable; containers always talk to each other on the standard internal ports.
 - **Kafka is internal.** It is reachable from other containers as `kafka:9092` but not published to the host. Add a second listener when you need host access.
 - **Image tags** (`postgres:17`, `redis:7.4`, `rabbitmq:4.1`, `apache/kafka:3.9.1`, `nginx:1.28`, `prom/prometheus:v3.5.0`, `grafana/grafana:12.1.0`) are pinned; bump them deliberately. Nginx must be 1.27.3 or newer for the `resolve` upstream parameter used by the load balancer.
-- **Security posture is dev-grade:** services bind to localhost, there is no TLS, and `/health/` and `/api/docs` are exposed through Nginx. Revisit before deploying anywhere public.
+- **Security posture is dev-grade:** see the Security section for what is covered and the known limitations.

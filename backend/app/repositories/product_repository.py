@@ -19,3 +19,9 @@ class ProductRepository:
 
     def get(self, product_id: uuid.UUID) -> Product | None:
         return self.db.get(Product, product_id)
+
+    def get_many(self, product_ids: Sequence[uuid.UUID]) -> dict[uuid.UUID, Product]:
+        if not product_ids:
+            return {}
+        rows = self.db.scalars(select(Product).where(Product.id.in_(product_ids))).all()
+        return {product.id: product for product in rows}

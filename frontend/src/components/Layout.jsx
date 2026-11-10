@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { NavLink, Outlet } from "react-router-dom";
 import Icon from "./icons.jsx";
+import { Badge, Button } from "./ui.jsx";
+import { useAuth } from "../context/AuthContext.jsx";
 import { useTheme } from "../hooks/useTheme.js";
 
 const NAV_ITEMS = [
@@ -41,13 +43,14 @@ function SidebarContent({ onNavigate }) {
         ))}
       </nav>
 
-      <div className="px-6 py-4 text-xs text-slate-400 dark:text-slate-500">v0.1.0 · foundation</div>
+      <div className="px-6 py-4 text-xs text-slate-400 dark:text-slate-500">v0.2.0</div>
     </div>
   );
 }
 
 export default function Layout() {
   const { dark, toggle } = useTheme();
+  const { user, logout } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
 
   return (
@@ -78,14 +81,24 @@ export default function Layout() {
             <Icon name="menu" />
           </button>
           <div className="hidden lg:block" />
-          <button
-            type="button"
-            onClick={toggle}
-            className="rounded-lg p-2 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
-            aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
-          >
-            <Icon name={dark ? "sun" : "moon"} />
-          </button>
+          <div className="flex items-center gap-3">
+            <div className="hidden text-right sm:block">
+              <p className="text-sm font-medium leading-tight">{user.full_name}</p>
+              <p className="text-xs leading-tight text-slate-500 dark:text-slate-400">{user.email}</p>
+            </div>
+            {user.role === "admin" && <Badge tone="blue">Admin</Badge>}
+            <Button variant="secondary" onClick={logout}>
+              Sign out
+            </Button>
+            <button
+              type="button"
+              onClick={toggle}
+              className="rounded-lg p-2 text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+              aria-label={dark ? "Switch to light theme" : "Switch to dark theme"}
+            >
+              <Icon name={dark ? "sun" : "moon"} />
+            </button>
+          </div>
         </header>
 
         <main className="mx-auto max-w-6xl px-4 py-8 sm:px-8">

@@ -19,7 +19,7 @@ from app.models import (
 
 @pytest.fixture()
 def user(db):
-    user = User(email="u@example.com", full_name="U")
+    user = User(email="u@example.com", full_name="U", password_hash="not-a-real-hash")
     db.add(user)
     db.commit()
     return user
@@ -84,13 +84,15 @@ def test_product_appears_once_per_order(db, user, product):
         db.commit()
 
 
-def test_idempotency_key_is_unique(db, user):
-    db.add_all(
-        [
-            Order(user_id=user.id, total_amount=Decimal("1"), idempotency_key="k"),
-            Order(user_id=user.id, total_amount=Decimal("1"), idempotency_key="k"),
-        ]
-    )
+def test_idempotency_key_is_unique_per_user(db, user):
+    other = User(email="o@example.com", full_name="O", password_hash="not-a-real-hash")
+    db.add(other)
+    db.flush()
+    db.add(Order(user_id=user.id, total_amount=Decimal("1"), idempotency_key="k"))
+    db.add(Order(user_id=other.id, total_amount=Decimal("1"), idempotency_key="k"))  # other user: ok
+    db.commit()
+
+    db.add(Order(user_id=user.id, total_amount=Decimal("1"), idempotency_key="k"))
     with pytest.raises(IntegrityError):
         db.commit()
 
