@@ -1,6 +1,6 @@
 # OrderFlow
 
-A distributed order-processing platform. Current state: **Phase 2** — authentication, idempotent order creation with a transactional outbox, and the full local infrastructure. Stock reservation, payments, and the Kafka/RabbitMQ workflows come next.
+A distributed order-processing platform. Current state: **Phase 3** — authentication, idempotent order creation with a transactional outbox, and an **outbox relay that publishes order events to Kafka** (at-least-once, ordered per order, retries with backoff). Stock reservation, payments, and the RabbitMQ saga come next.
 
 | Layer | Technology |
 | --- | --- |
@@ -15,7 +15,7 @@ A distributed order-processing platform. Current state: **Phase 2** — authenti
 - **Accounts:** register, sign in, sign out. Argon2id password hashing, short-lived JWT access tokens, roles (`customer`, `admin`).
 - **Orders:** create (prices and totals computed on the server), list (paginated, filter by status), view, cancel. Customers see only their own orders; admins see all.
 - **Idempotent order creation:** every `POST /orders` carries an `Idempotency-Key`. Retrying the same request returns the original order instead of a duplicate; reusing a key with a different request is rejected with 409. Keys are scoped per user.
-- **Transactional outbox:** creating or cancelling an order writes an `outbox_events` row in the **same database transaction**, so an event exists if and only if the change happened. (Publishing those events to Kafka is Phase 3.)
+- **Transactional outbox:** creating or cancelling an order writes an `outbox_events` row in the **same database transaction**, so an event exists if and only if the change happened. The **outbox relay** (a separate worker) publishes them to Kafka; see [Outbox relay](#outbox-relay-phase-3).
 - **Dashboard:** login/register, orders list, new-order form, order detail with cancel. Products, Inventory, Analytics, and System Health pages from Phase 1.
 
 ## Project structure
@@ -26,15 +26,16 @@ orderflow/
 │   ├── app/
 │   │   ├── api/            # HTTP layer: routers and dependencies
 │   │   │   ├── health.py   #   /health/live, /health/ready
-│   │   │   └── v1/         #   /api/v1: auth, orders, products
+│   │   │   └── v1/         #   /api/v1: auth, orders, products, admin
 │   │   ├── core/           # config, database, errors, security (hashing, JWT), rate limit, metrics
 │   │   ├── models/         # SQLAlchemy models (9 tables)
 │   │   ├── schemas/        # Pydantic request/response models
 │   │   ├── services/       # business rules (auth, orders, products)
 │   │   ├── repositories/   # data access
+│   │   ├── workers/        # outbox relay process + Kafka publisher
 │   │   ├── main.py         # app factory
 │   │   └── seed.py         # idempotent demo data
-│   ├── alembic/            # migrations: 0001 initial schema, 0002 auth + per-user idempotency
+│   ├── alembic/            # migrations: 0001 initial schema, 0002 auth + per-user idempotency, 0003 outbox relay
 │   ├── tests/
 │   ├── Dockerfile, requirements.txt, requirements-dev.txt
 ├── frontend/               # React app (Vite)
@@ -69,6 +70,8 @@ Open http://localhost:8080 and sign in with a demo account:
 | Admin | `admin@orderflow.local` | `SEED_ADMIN_PASSWORD` from your `.env` |
 
 Or click **Create one** to register your own account (always a customer).
+
+**Upgrading from Phase 2:** no `.env` changes are needed. `docker compose up -d --build` applies migration `0003` and starts the new `outbox-relay` service.
 
 **Upgrading from Phase 1:** run `python3 scripts/init_env.py` once (it adds the new variables to your existing `.env` without touching the others), then `docker compose up -d --build` and the seed command above. Migration `0002` runs automatically; the seed command gives the existing demo accounts their passwords.
 
@@ -111,6 +114,44 @@ curl -s localhost:8080/api/v1/orders -H "Authorization: Bearer $TOKEN" -H 'Idemp
 ```
 
 Run the same order command twice: the second call returns `200` with the same order and writes no second outbox event.
+
+## Outbox relay (Phase 3)
+
+The API never talks to Kafka. It writes an `outbox_events` row in the same transaction as the order change; the **`outbox-relay`** service (`python -m app.workers.outbox_relay`) publishes those rows to Kafka.
+
+```
+API  --(1 transaction)-->  orders + outbox_events  --poll-->  outbox-relay  --acks=all-->  Kafka topic orderflow.order.events
+```
+
+| Property | How |
+| --- | --- |
+| No lost events | A row is marked `published` only after Kafka acknowledged it (`acks=all`, idempotent producer). Crash before the commit means the row stays `pending` and is sent again. |
+| At-least-once | A resend can duplicate a message. Every message carries an `event_id` (header and body) so consumers can dedupe with the `processed_events` table (Phase 4). |
+| Ordered per order | Kafka key = order id (same partition), and the relay only releases an event when no earlier event of the same order is unpublished. |
+| Safe to scale | `FOR UPDATE SKIP LOCKED` batches: replicas claim different rows (`docker compose up -d --scale outbox-relay=2`). |
+| Retries | Exponential backoff with jitter (`available_at`), then status `failed` after `OUTBOX_MAX_ATTEMPTS` (default 10). A failed event blocks later events of the same order until it is requeued. |
+| Observable | Prometheus metrics on `:9100`, Grafana dashboard **OrderFlow Outbox Relay**, admin-only `GET /api/v1/admin/outbox`, and an "Outbox relay → Kafka" row on System Health (admins only). |
+
+Message format (JSON value, key = order id, headers `event_id`, `event_type`, `aggregate_type`, `occurred_at`):
+
+```json
+{"event_id": "…", "event_type": "order.created", "aggregate_type": "order", "aggregate_id": "…", "occurred_at": "…", "payload": {"order_id": "…", "items": [...]}}
+```
+
+Try it:
+
+```bash
+docker compose logs -f outbox-relay                      # "batch: published=1 ..."
+docker compose exec kafka /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 --topic orderflow.order.events --from-beginning --property print.key=true --property print.headers=true
+docker compose stop kafka                                # place an order: it stays pending, retries with backoff
+docker compose start kafka                               # the backlog drains by itself
+docker compose exec outbox-relay python -m app.workers.outbox_relay --requeue-failed   # after fixing a failure
+```
+
+Tuning (optional environment variables, defaults in `app/core/config.py`): `OUTBOX_BATCH_SIZE`, `OUTBOX_POLL_INTERVAL_SECONDS`, `OUTBOX_MAX_ATTEMPTS`, `OUTBOX_BACKOFF_BASE_SECONDS`, `OUTBOX_BACKOFF_MAX_SECONDS`, `OUTBOX_PUBLISH_TIMEOUT_SECONDS`, `OUTBOX_TOPIC_PARTITIONS`.
+
+Trade-offs worth knowing: row locks are held while waiting for the Kafka ack (bounded by the publish timeout), polling adds up to `OUTBOX_POLL_INTERVAL_SECONDS` of latency (a log-based CDC tool such as Debezium would remove it), and published rows are never deleted yet (add a retention job before production use).
 
 ## Security
 
@@ -223,12 +264,12 @@ Nine tables: `users`, `products`, `inventory`, `orders`, `order_items`, `payment
 - CHECK constraints for statuses, non-negative amounts, positive quantities, and `quantity_reserved <= quantity_on_hand`.
 - Unique constraints include `(user_id, idempotency_key)` on orders, `(order_id, product_id)` on items and reservations, and `(event_id, consumer)` on `processed_events` (idempotent consumers).
 - `inventory.version` provides optimistic locking.
-- `outbox_events` has a partial index on pending rows for the future outbox relay. Order creation writes `order.created` and cancellation writes `order.cancelled`, in the same transaction as the order change.
+- `outbox_events` has partial indexes for the relay's polling query and its per-order ordering check. Order creation writes `order.created` and cancellation writes `order.cancelled`, in the same transaction as the order change.
 - Constraint and index names follow a naming convention so migrations are deterministic.
 
 ## What is intentionally not built yet
 
-Stock reservation (creating an order does **not** change inventory yet), payments, the outbox relay, Kafka producers, RabbitMQ consumers, and the saga/compensation logic: these are Phase 3 and 4. `/health/ready` checks PostgreSQL only; Redis, RabbitMQ, and Kafka checks should be added when the code depends on them. Inventory and Analytics pages are placeholders (Analytics charts use sample data).
+Stock reservation (creating an order does **not** change inventory yet), payments, Kafka/RabbitMQ **consumers**, and the saga/compensation logic: these are Phase 4. Events are already being published to Kafka, but nothing consumes them yet. `/health/ready` checks PostgreSQL only; Redis, RabbitMQ, and Kafka checks should be added when the code depends on them. Inventory and Analytics pages are placeholders (Analytics charts use sample data).
 
 ## Notes and manual steps
 
