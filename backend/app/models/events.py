@@ -22,17 +22,25 @@ from app.models.enums import OutboxStatus
 
 class OutboxEvent(UUIDPrimaryKeyMixin, Base):
     """Transactional outbox: written in the same DB transaction as the change it describes,
-    then published to the message brokers by a relay (added in a later phase)."""
+    then published to Kafka by the outbox relay (app/workers/outbox_relay.py)."""
 
     __tablename__ = "outbox_events"
     __table_args__ = (
         CheckConstraint(in_values("status", OutboxStatus), name="status_valid"),
         CheckConstraint("attempts >= 0", name="attempts_non_negative"),
-        # Relay polls oldest unpublished events; a partial index keeps that cheap.
+        # The relay polls events that are due, oldest first; a partial index keeps that cheap.
         Index(
-            "ix_outbox_events_pending_created_at",
+            "ix_outbox_events_pending_available_at",
+            "available_at",
             "created_at",
             postgresql_where="status = 'pending'",
+        ),
+        # Ordering check: "is there an earlier unpublished event for this aggregate?"
+        Index(
+            "ix_outbox_events_aggregate_unpublished",
+            "aggregate_id",
+            "created_at",
+            postgresql_where="status <> 'published'",
         ),
     )
 
@@ -48,6 +56,10 @@ class OutboxEvent(UUIDPrimaryKeyMixin, Base):
     attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    # Not eligible for publishing before this time (set by the relay for retry backoff).
+    available_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

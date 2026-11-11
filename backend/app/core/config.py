@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     )
 
     app_name: str = "OrderFlow API"
-    app_version: str = "0.2.0"
+    app_version: str = "0.3.0"
     environment: str = "development"
     log_level: str = "INFO"
     api_v1_prefix: str = "/api/v1"
@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     # Wired up in later phases; optional so the foundation runs without them.
     rabbitmq_url: str | None = None
     kafka_bootstrap_servers: str | None = None
+
+    # Outbox relay (the worker that publishes outbox_events rows to Kafka).
+    outbox_batch_size: int = 100
+    outbox_poll_interval_seconds: float = 0.5  # idle sleep between polls
+    outbox_max_attempts: int = 10  # after this many failures an event becomes "failed"
+    outbox_backoff_base_seconds: float = 1.0  # retry delay: base * 2^(attempt-1), capped, +-20% jitter
+    outbox_backoff_max_seconds: float = 60.0
+    outbox_publish_timeout_seconds: float = 10.0
+    outbox_topic_prefix: str = "orderflow"  # events go to "<prefix>.<aggregate_type>.events"
+    outbox_topic_partitions: int = 3
+    outbox_metrics_port: int = 9100
 
     # Comma-separated in the environment, e.g. "http://localhost:5173,http://localhost:8080".
     cors_origins: Annotated[list[str], NoDecode] = ["http://localhost:5173"]
@@ -63,7 +74,15 @@ class Settings(BaseSettings):
             )
         return value
 
-    @field_validator("access_token_expire_minutes", "login_max_attempts", "login_window_seconds")
+    @field_validator(
+        "access_token_expire_minutes",
+        "login_max_attempts",
+        "login_window_seconds",
+        "outbox_batch_size",
+        "outbox_max_attempts",
+        "outbox_topic_partitions",
+        "outbox_metrics_port",
+    )
     @classmethod
     def must_be_positive(cls, value: int) -> int:
         if value < 1:

@@ -120,9 +120,29 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      # kafka is intentionally not a dependency yet: nothing uses it until producers exist.
+      # The API never talks to Kafka: it only writes outbox rows. The relay below publishes them.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/live', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # Publishes outbox_events rows to Kafka (at-least-once, ordered per order). Safe to scale:
+  # replicas claim different rows (FOR UPDATE SKIP LOCKED). Metrics on :9100.
+  outbox-relay:
+    build: ./backend
+    image: orderflow-backend:local
+    command: ["python", "-m", "app.workers.outbox_relay"]
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:9100/metrics', timeout=3)"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -171,6 +191,7 @@ services:
       - prometheus_data:/prometheus
     depends_on:
       - api
+      - outbox-relay
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:9090/-/healthy"]
       interval: 10s

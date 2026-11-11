@@ -43,7 +43,7 @@ function SidebarContent({ onNavigate }) {
         ))}
       </nav>
 
-      <div className="px-6 py-4 text-xs text-slate-400 dark:text-slate-500">v0.2.0</div>
+      <div className="px-6 py-4 text-xs text-slate-400 dark:text-slate-500">v0.3.0</div>
     </div>
   );
 }

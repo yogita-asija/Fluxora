@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import Settings, get_settings
 from app.core.database import get_db
-from app.core.errors import UnauthorizedError
+from app.core.errors import ForbiddenError, UnauthorizedError
 from app.core.rate_limit import LoginThrottle, get_login_throttle
 from app.models import User
 from app.repositories.order_repository import OrderRepository
@@ -51,3 +51,12 @@ def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+
+def require_admin(user: CurrentUser) -> User:
+    if not user.is_admin:
+        raise ForbiddenError("Administrator access required")
+    return user
+
+
+AdminUser = Annotated[User, Depends(require_admin)]
